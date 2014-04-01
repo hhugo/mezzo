@@ -59,7 +59,7 @@ let evar v =
   | NonLocal v -> E.EOpen v
 
 let resolve_datacon env dref =
-  let v, datacon, f = KindCheck.resolve_datacon env dref in
+  let v, datacon, f = KindCheck.resolve_datacon ~translating:true env dref in
   tvar v, datacon, f
 
 (* -------------------------------------------------------------------------- *)
@@ -122,9 +122,8 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
   | TyVar x ->
       twice (tvar (find_variable env x)) (find_kind env x)
 
-  | TyConcrete ((dref, fields), clause) ->
+  | TyConcrete (dref, fields, clause) ->
       let fields1, fields2 = translate_fields_values env fields in
-      let perms1, perms2 = translate_fields_perms env fields in
       let v, dc, f = resolve_datacon env dref in
       let branch1 = {
         T.branch_flavor = f;
@@ -136,7 +135,7 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
         branch1 with
         T.branch_fields = fields2
       } in
-      T.construct_branch [] branch1 perms1, T.construct_branch [] branch2 perms2, KType
+      T.TyConcrete branch1, T.TyConcrete branch2, KType
 
   | TySingleton ty ->
       let ty, _ = translate_type_reset env ty in
@@ -243,22 +242,10 @@ and translate_type_reset_no_kind env t : T.typ =
   fst (translate_type_reset env t)
 
 and translate_fields_values env fields =
-  List.split (MzList.map_some (function
-    | FieldValue (f, ty) ->
-        (* No [reset] here. *)
-        let ty1, ty2, _ = translate_type env ty in
-        Some ((f, ty1), (f, ty2))
-    | FieldPermission _ ->
-        None
-  ) fields)
-
-and translate_fields_perms env fields =
-  List.split (MzList.map_some (function
-    | FieldValue _ ->
-        None
-    | FieldPermission ty ->
-        let ty1, ty2, _ = translate_type env ty in
-        Some (ty1, ty2)
+  List.split (List.map (fun (f, ty) ->
+    (* No [reset] here. *)
+    let ty1, ty2, _ = translate_type env ty in
+    (f, ty1), (f, ty2)
   ) fields)
 
 and translate_adopts_clause env = function
@@ -295,55 +282,44 @@ and translate_implication env (cs : mode_constraint list) = function
 
 (* -------------------------------------------------------------------------- *)
 
-let rec translate_data_type_def_branch
+let translate_data_type_def_branch
     (env: env)
     (global_flavor: DataTypeFlavor.flavor)
     (adopts: typ option)
     (branch: data_type_def_branch)
   : T.typ =
-  let branch_flavor, datacon, bindings, fields = branch in
-  let env = extend env bindings in
-  let branch = {
+  let branch_flavor, ty = branch in
+  let datacon, _fields, _dummy_adopts = find_branch ty in
+  let datacon = datacon_name_assert_unqualified datacon in
+  (* FIXME this "translation mode" has undesirable side-effects: when checking
+   * an interface, it makes it legal to refer to an undefined constructor... *)
+  (* Here is what happens:
+    * - [translate_type] calls [resolve_datacon] which fails to resolve the data
+    *   constructor: it hasn't been bound!
+    * - Since we are in the special "translating" mode, [resolve_datacon] adopts
+    *   a different behavior, and returns dummy values for
+    *     - the flavor, as well as
+    *     - the left element of the [branch_datacon] field, and
+    *     - the adopts clause which is originally parsed as "None".
+    * - The translation succeeds with these dummy values, and we fix them up
+    *   after the fact. This minimizes code duplication as the cost of a
+    *   slightly contrived workflow. *)
+  (* FIXME this should be a translate_type_reset_no_kind here, but it turns out
+   * we should do a reset on the individual fields, not on the branch itself;
+   * indeed, if the field is a function, auto-introduced, universal quantifiers
+   * will appear _above_ the branch which is a terrible, terrible thing. *)
+  (* SOLUTION?: have a different function just for
+   * translate_data_type_def_branch, similar to find_branch, and then does
+   * something with it... but there would be a lot of code duplication with
+   * translate_type_reset... *)
+  let ty, _, _ = translate_type env ty in
+  T.touch_branch ty (fun branch -> { branch with
     T.branch_flavor =
       DataTypeFlavor.join global_flavor branch_flavor
         (fun () -> assert false) (* cannot happen *);
-    (* [Expressions.bind_group_definition] will take care of putting the right
-     * value. We perform eager resolving: as soon we've opened the binder for
-     * the data type, all its branches contain a reference to it. So for now,
-     * just put [TyUnknown]. *)
     T.branch_datacon = T.TyUnknown, datacon;
-    T.branch_fields = translate_field_defs_values env fields;
-    T.branch_adopts = translate_adopts env adopts
-  } in
-  let perms = translate_field_defs_perms env fields in
-  let bindings = List.map (name_user env) bindings in
-  T.construct_branch bindings branch perms
-
-and translate_adopts env (adopts : typ option) =
-  match adopts with
-  | None ->
-      TypeCore.ty_bottom
-  | Some t ->
-      translate_type_reset_no_kind env t
-
-and translate_field_defs_values env fields =
-  MzList.map_some (function
-    | FieldValue (name, t) ->
-        Some (name, translate_type_reset_no_kind env t)
-    | FieldPermission _ ->
-        None
-  ) fields
-
-and translate_field_defs_perms env fields =
-  MzList.map_some (function
-    | FieldValue _ ->
-        None
-    | FieldPermission t ->
-        let t, _, _ = translate_type env t in
-        Some t
-  ) fields
-
-
+    T.branch_adopts = translate_adopts_clause env adopts;
+  })
 ;;
 
 let rec tunloc = function
@@ -508,7 +484,7 @@ let clean_pattern pattern =
         in
         PConstruct (name, List.combine fields pats),
         if List.exists ((<>) TyUnknown) annotations then
-          TyConcrete ((name, List.map2 (fun field t -> FieldValue (field, t)) fields annotations), None)
+          TyConcrete (name, List.combine fields annotations, None)
         else
           TyUnknown
 
@@ -603,18 +579,14 @@ let rec extrude_wildcards env (t: typ): typ * type_binding list =
   | TyExists _
   | TyUnknown ->
       t, []
-  | TyConcrete ((datacon, fields), clause) ->
+  | TyConcrete (datacon, fields, clause) ->
       let fields, bindings = List.fold_left (fun (fields, bindingss) field ->
-        match field with
-        | FieldValue (name, t) ->
-            let t, bindings = extrude_wildcards env t in
-            FieldValue (name, t) :: fields, bindings :: bindingss
-        | FieldPermission t ->
-            let t, bindings = extrude_wildcards env t in
-            FieldPermission t :: fields, bindings :: bindingss
+        let name, t = field in
+        let t, bindings = extrude_wildcards env t in
+        (name, t) :: fields, bindings :: bindingss
       ) ([], []) fields in
       let fields = List.rev fields in
-      TyConcrete ((datacon, fields), clause), List.concat bindings
+      TyConcrete (datacon, fields, clause), List.concat bindings
   | TyAnchoredPermission (x, t) ->
       let t, bindings = extrude_wildcards env t in
       TyAnchoredPermission (x, t), bindings

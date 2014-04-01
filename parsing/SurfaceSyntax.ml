@@ -108,6 +108,11 @@ type datacon_reference = {
   mutable datacon_info: datacon_info option;
 }
 
+let datacon_name_assert_unqualified datacon =
+  match datacon with
+  | { datacon_unresolved = Unqualified dc; _ } -> dc
+  | _ -> assert false
+
 (* ---------------------------------------------------------------------------- *)
 
 (* Types and permissions. *)
@@ -139,7 +144,7 @@ type typ =
   | TyDynamic
   | TyEmpty
   | TyVar of Variable.name maybe_qualified
-  | TyConcrete of (datacon_reference * data_field_def list) * adopts_clause
+  | TyConcrete of data_type_branch
   | TySingleton of typ
   | TyApp of typ * typ list
   | TyArrow of typ * typ
@@ -156,9 +161,9 @@ type typ =
 
 and mode_constraint = Mode.mode * typ
 
-and data_field_def =
-  | FieldValue of Field.name * typ
-  | FieldPermission of typ (* TEMPORARY kill this! *)
+and data_field_def = Field.name * typ
+
+and data_type_branch = datacon_reference * data_field_def list * adopts_clause
 
 and adopts_clause =
     typ option
@@ -179,8 +184,11 @@ type data_type_def_lhs =
 type single_fact = 
   | Fact of mode_constraint list * mode_constraint
 
+(* Our invariant, juste like in [TypeCore], is that the [typ] below is,
+ * possibly after crossing several types that have no runtime representation
+ * (e.g. quantifiers, bars), a [TyConcrete]. *)
 type data_type_def_branch =
-    DataTypeFlavor.flavor * Datacon.name * type_binding list * data_field_def list
+  DataTypeFlavor.flavor * typ
 
 type data_type_def_rhs =
   | Concrete of DataTypeFlavor.flavor * data_type_def_branch list * adopts_clause
@@ -214,6 +222,21 @@ let binding_of_lhs (lhs : data_type_def_lhs) : type_binding =
   let kind = List.fold_right (fun (_, (_, k, _)) kind -> KArrow (k, kind)) params kind in
   (* Construct a binding. *)
   x, kind, loc
+
+(* Extract the data constructor for a given type. This function should be kept
+ * in sync with its counterpart from [TypeCore]. *)
+let rec find_branch (t: typ): data_type_branch =
+  match t with
+  | TyBar (t, _) ->
+      find_branch t
+  | TyConcrete b ->
+      b
+  | TyExists (_, t) ->
+      find_branch t
+  | TyLocated (t, _) ->
+      find_branch t
+  | _ ->
+      assert false
 
 (* ---------------------------------------------------------------------------- *)
 
@@ -354,12 +377,10 @@ let rec type_to_pattern (ty : typ) : pattern =
   | TyTuple tys ->
       PTuple (List.map type_to_pattern tys)
 
-  | TyConcrete ((datacon, fields), _adopts) ->
+  | TyConcrete (datacon, fields, _adopts) ->
       let fps =
-       List.fold_left (fun fps field ->
-         match field with
-          | FieldValue (f, ty) -> (f, type_to_pattern ty) :: fps
-          | FieldPermission _  -> fps
+       List.fold_left (fun fps (f, ty) ->
+         (f, type_to_pattern ty) :: fps
        ) [] fields in
       PConstruct (datacon, fps)
 
