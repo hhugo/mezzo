@@ -59,7 +59,7 @@ let evar v =
   | NonLocal v -> E.EOpen v
 
 let resolve_datacon env dref =
-  let v, datacon, f = KindCheck.resolve_datacon ~translating:true env dref in
+  let v, datacon, f = KindCheck.resolve_datacon env dref in
   tvar v, datacon, f
 
 (* -------------------------------------------------------------------------- *)
@@ -87,15 +87,15 @@ let auto_tyq q binding ty =
 
 (* TEMPORARY maybe try to preserve sharing when there is no consumes *)
 
-let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
+let rec translate_type_raw env (ty : typ) ff : T.typ * T.typ * kind =
   match ty with
 
   | TyLocated (ty, loc) ->
-      translate_type (locate env loc) ty
+      ff (locate env loc) ty
 
   | TyConsumes ty ->
       (* First, translate [ty]. *)
-      let ty1, _, kind = translate_type env ty in
+      let ty1, _, kind = ff env ty in
       (* Construct a version of this type where everything is kept, *)
       ty1,
       (* and a version of this type where everything is lost. *)
@@ -105,7 +105,7 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
 
   | TyTuple tys ->
       let tys1, tys2 = MzList.split_map (fun ty ->
-        let ty1, ty2, _ = translate_type env ty
+        let ty1, ty2, _ = ff env ty
         in ty1, ty2
       ) tys in
       T.TyTuple tys1, T.TyTuple tys2, KType
@@ -138,12 +138,12 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
       T.TyConcrete branch1, T.TyConcrete branch2, KType
 
   | TySingleton ty ->
-      let ty, _ = translate_type_reset env ty in
+      let ty, _ = translate_type_reset_raw env ty ff in
       twice (T.TySingleton ty) KType
 
   | TyApp (ty1, ty2s) ->
-      let ty1, kind1 = translate_type_reset env ty1 in
-      let ty2s, _ = MzList.split_map (translate_type_reset env) ty2s in
+      let ty1, kind1 = translate_type_reset_raw env ty1 ff in
+      let ty2s, _ = MzList.split_map (fun t -> translate_type_reset_raw env t ff) ty2s in
       let _, kind = as_arrow kind1 in
       twice (T.TyApp (ty1, ty2s)) kind
 
@@ -159,38 +159,38 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
       twice ty KType
 
   | TyForall (binding, ty) ->
-      translate_quantified_type env T.Forall binding ty
+      translate_quantified_type_raw env T.Forall binding ty ff
 
   | TyExists (binding, ty) ->
-      translate_quantified_type env T.Exists binding ty
+      translate_quantified_type_raw env T.Exists binding ty ff
 
   | TyAnchoredPermission (ty1, ty2) ->
-      let ty1, _ = translate_type_reset env ty1 in
-      let ty2, _ = translate_type_reset env ty2 in
+      let ty1, _ = translate_type_reset_raw env ty1 ff in
+      let ty2, _ = translate_type_reset_raw env ty2 ff in
       twice (T.TyAnchoredPermission (ty1, ty2)) KPerm
 
   | TyStar (p, q) ->
-      let p1, p2, _ = translate_type env p in
-      let q1, q2, _ = translate_type env q in
+      let p1, p2, _ = ff env p in
+      let q1, q2, _ = ff env q in
       T.TyStar (p1, q1), T.TyStar (p2, q2), KPerm
 
   | TyNameIntro (x, ty) ->
       (* In principle, [x] has already been bound in the environment.
          The translation of this type is [(=x | x @ ty)]. *)
       let x = tvar (find_variable env (Unqualified x)) in
-      let ty1, ty2, _ = translate_type env ty in
+      let ty1, ty2, _ = ff env ty in
       T.TyBar (T.TySingleton x, T.TyAnchoredPermission (x, ty1)),
       T.TyBar (T.TySingleton x, T.TyAnchoredPermission (x, ty2)),
       KType
 
   | TyBar (ty, p) ->
-      let ty1, ty2, _ = translate_type env ty in
-      let p1, p2, _ = translate_type env p in
+      let ty1, ty2, _ = ff env ty in
+      let p1, p2, _ = ff env p in
       T.TyBar (ty1, p1), T.TyBar (ty2, p2), KType
 
   | TyAnd (c, ty) ->
       let c = translate_mode_constraint env c in
-      let ty1, ty2, _ = translate_type env ty in
+      let ty1, ty2, _ = ff env ty in
       T.TyAnd (c, ty1), T.TyAnd (c, ty2), KType
 
   | TyImply (c, ty) ->
@@ -198,6 +198,9 @@ let rec translate_type env (ty : typ) : T.typ * T.typ * kind =
 
   | TyWildcard ->
       Log.error "Illegal wildcard (FIXME: turn this into a real error message)"
+
+and translate_type env (ty : typ) : T.typ * T.typ * kind =
+  translate_type_raw env ty translate_type
 
 and translate_arrow_type env domain codomain =
   (* Bind a fresh variable to stand for the root of the function
@@ -227,16 +230,19 @@ and translate_arrow_type env domain codomain =
   let codomain = Hoist.hoist TypeCore.empty_env codomain in
   bindings, domain, codomain
 
-and translate_type_reset env ty : T.typ * kind =
+and translate_type_reset_raw env ty ff : T.typ * kind =
   (* Gather and bind the names introduced within [ty]. *)
   let bindings = names ty in
   let env = extend env bindings in
   (* Translate [ty]. There should be no [consumes] annotations, so the
      two types that are returned by this call are identical. *)
-  let ty, _, kind = translate_type env ty in
+  let ty, _, kind = ff env ty in
   (* Build a series of existential quantifiers. *)
   let ty = List.fold_right (auto_tyq T.Exists) bindings ty in
   ty, kind
+
+and translate_type_reset env ty =
+  translate_type_reset_raw env ty translate_type
 
 and translate_type_reset_no_kind env t : T.typ =
   fst (translate_type_reset env t)
@@ -255,9 +261,9 @@ and translate_adopts_clause env = function
       translate_type_reset_no_kind env ty
 
 (* TEMPORARY merge TyForall/TyExists in the surface syntax *)
-and translate_quantified_type env q binding ty =
+and translate_quantified_type_raw env q binding ty ff =
   let env = extend env [ binding ] in
-  let ty, kind = translate_type_reset env ty in
+  let ty, kind = translate_type_reset_raw env ty ff in
   let ty = T.TyQ (q, name_user env binding, UserIntroduced, ty) in
   twice ty kind
 
@@ -289,37 +295,51 @@ let translate_data_type_def_branch
     (branch: data_type_def_branch)
   : T.typ =
   let branch_flavor, ty = branch in
-  let datacon, _fields, _dummy_adopts = find_branch ty in
-  let datacon = datacon_name_assert_unqualified datacon in
-  (* FIXME this "translation mode" has undesirable side-effects: when checking
-   * an interface, it makes it legal to refer to an undefined constructor... *)
-  (* Here is what happens:
-    * - [translate_type] calls [resolve_datacon] which fails to resolve the data
-    *   constructor: it hasn't been bound!
-    * - Since we are in the special "translating" mode, [resolve_datacon] adopts
-    *   a different behavior, and returns dummy values for
-    *     - the flavor, as well as
-    *     - the left element of the [branch_datacon] field, and
-    *     - the adopts clause which is originally parsed as "None".
-    * - The translation succeeds with these dummy values, and we fix them up
-    *   after the fact. This minimizes code duplication as the cost of a
-    *   slightly contrived workflow. *)
-  (* FIXME this should be a translate_type_reset_no_kind here, but it turns out
-   * we should do a reset on the individual fields, not on the branch itself;
-   * indeed, if the field is a function, auto-introduced, universal quantifiers
-   * will appear _above_ the branch which is a terrible, terrible thing. *)
-  (* SOLUTION?: have a different function just for
-   * translate_data_type_def_branch, similar to find_branch, and then does
-   * something with it... but there would be a lot of code duplication with
-   * translate_type_reset... *)
-  let ty, _, _ = translate_type env ty in
-  T.touch_branch ty (fun branch -> { branch with
-    T.branch_flavor =
-      DataTypeFlavor.join global_flavor branch_flavor
-        (fun () -> assert false) (* cannot happen *);
-    T.branch_datacon = T.TyUnknown, datacon;
-    T.branch_adopts = translate_adopts_clause env adopts;
-  })
+  let rec translate_type_of_branch env ty =
+    match ty with
+    | TyLocated _
+    | TyExists _ ->
+        (* Thanks to the "raw" version of [translate_type], we are able to say
+         * very concisely: "do whatever is default behavior for these three
+         * cases, then call back into us for the next case". *)
+        translate_type_raw env ty translate_type_of_branch
+
+    | TyBar (ty, p) ->
+        let ty1, ty2, _ = translate_type_of_branch env ty in
+        let p1, p2, _ = translate_type env p in
+        T.TyBar (ty1, p1), T.TyBar (ty2, p2), KType
+
+    | TyConcrete (dref, fields, _dummy_adopts) ->
+        let branch_fields = List.map (fun (name, t) ->
+            (* This is where we branch onto the regular flavor of translate_type *)
+            name, translate_type_reset_no_kind env t
+          ) fields
+        in
+        let branch_datacon =
+          T.TyUnknown, 
+          datacon_name_assert_unqualified dref
+        in
+        let branch_flavor = 
+          DataTypeFlavor.join global_flavor branch_flavor
+            (fun () -> assert false) (* cannot happen *);
+        in
+        let branch_adopts =
+          translate_adopts_clause env adopts
+        in
+        let ty =
+          T.TyConcrete {
+            T.branch_flavor; branch_fields; branch_datacon; branch_adopts
+          }
+        in
+        ty, ty, KType
+
+    | _ ->
+        Log.error "Malformed data type definition, should've been ruled out by \
+          KindCheck: %a" MzPprint.pdoc ((fun () ->
+            SurfaceSyntaxPrinter.print ty), ())
+  in
+  let ty, _, _ = translate_type_of_branch env ty in
+  ty
 ;;
 
 let rec tunloc = function

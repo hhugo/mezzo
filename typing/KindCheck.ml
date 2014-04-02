@@ -366,33 +366,17 @@ let find_datacon env (datacon : Datacon.name maybe_qualified) : 'v var * datacon
   with Not_found ->
     unbound "data constructor" Datacon.print env datacon
 
-(* The [TransSurface] module relies on the special behavior of this function
- * when hitting an unresolved data constructor. In [TransSurface], all
- * references to data constructors have been checked by [KindCheck], meaning
- * that the only situation where we have a [Not_found] error is when translating
- * data type definitions. We return dummy values and rely on
- * [translate_data_type_def_branch] to fix things up after. *)
-let resolve_datacon ?(translating=false) env (dref : datacon_reference) : 'v var * Datacon.name * DataTypeFlavor.flavor  =
-  let default find_datacon =
-    let datacon = dref.datacon_unresolved in
-    (* Get the type [v] with which this data constructor is associated,
-       and get its [info] record. *)
-    let v, info = find_datacon env datacon in
-    (* Write the address of the [info] record into the abstract syntax
-       tree. This info is used by the compiler. *)
-    dref.datacon_info <- Some info;
-    (* Return a triple of the type with which this data constructor is associated,
-       the unqualified name and the flavor of the data constructor. *)
-    v, unqualify datacon, info.datacon_flavor
-  in
-  if translating then
-    try default find_datacon_raw
-    with Not_found ->
-      let dc = datacon_name_assert_unqualified dref in
-      Local 0, dc, DataTypeFlavor.Immutable
-  else
-    default find_datacon
-
+let resolve_datacon env (dref : datacon_reference) : 'v var * Datacon.name * DataTypeFlavor.flavor  =
+  let datacon = dref.datacon_unresolved in
+  (* Get the type [v] with which this data constructor is associated,
+     and get its [info] record. *)
+  let v, info = find_datacon env datacon in
+  (* Write the address of the [info] record into the abstract syntax
+     tree. This info is used by the compiler. *)
+  dref.datacon_info <- Some info;
+  (* Return a triple of the type with which this data constructor is associated,
+     the unqualified name and the flavor of the data constructor. *)
+  v, unqualify datacon, info.datacon_flavor
 
 
 (* ---------------------------------------------------------------------------- *)

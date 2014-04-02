@@ -88,7 +88,7 @@ val find_nonlocal_variable: 'v env -> Variable.name -> 'v
     place with a [datacon_info] component. It returns a triple of the type with
     which this data constructor is associated, the unqualified name of this
     data constructor, and its flavor. *)
-val resolve_datacon: ?translating:bool -> 'v env -> datacon_reference -> 'v var * Datacon.name * DataTypeFlavor.flavor
+val resolve_datacon: 'v env -> datacon_reference -> 'v var * Datacon.name * DataTypeFlavor.flavor
 
 (** [get_exports env] returns the list of names that are exported by [env].
  * Calling this function only makes sense after type-checking took place. *)
