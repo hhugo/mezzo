@@ -298,16 +298,14 @@ let translate_data_type_def_branch
   let rec translate_type_of_branch env ty =
     match ty with
     | TyLocated _
-    | TyExists _ ->
+    | TyExists _
+    | TyBar _
+    | TyVar _
+    | TyStar _ ->
         (* Thanks to the "raw" version of [translate_type], we are able to say
-         * very concisely: "do whatever is default behavior for these three
-         * cases, then call back into us for the next case". *)
+         * very concisely: "do whatever is default behavior for these cases,
+         * then call back into us for the next case". *)
         translate_type_raw env ty translate_type_of_branch
-
-    | TyBar (ty, p) ->
-        let ty1, ty2, _ = translate_type_of_branch env ty in
-        let p1, p2, _ = translate_type env p in
-        T.TyBar (ty1, p1), T.TyBar (ty2, p2), KType
 
     | TyConcrete (dref, fields, _dummy_adopts) ->
         let branch_fields = List.map (fun (name, t) ->
@@ -331,7 +329,20 @@ let translate_data_type_def_branch
             T.branch_flavor; branch_fields; branch_datacon; branch_adopts
           }
         in
-        ty, ty, KType
+        (* The value that we're returning for the second component does _not_
+         * make sense; we know, however, that our caller will discard it (last
+         * few lines of translate_data_type_def_branch), so it's fine to put a
+         * placeholder here. *)
+        ty, T.TyUnknown, KType
+
+    | TyArrow _
+    | TyAnd _
+    | TyImply _ ->
+        Log.error "These is no translate_mode_constraint_raw, \
+          translate_implication_raw, translate_arrow_type_raw: if any of these \
+          three cases are meant to appear in a data type branch, the functions \
+          need to be converted to the _raw style so as to call back into \
+          translate_type_of_branch";
 
     | _ ->
         Log.error "Malformed data type definition, should've been ruled out by \
